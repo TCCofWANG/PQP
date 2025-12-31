@@ -7,13 +7,8 @@ class TokenizerWrapper:
 
 
 def get_wikitext2(nsamples, seed, seqlen, tokenizer):
-    # traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    # testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
-    # traindata = load_from_disk("/home/user0/public2/lzy/data/wikitext-2-raw-v1/train/")
-    # testdata = load_from_disk("/home/user0/public2/lzy/data/wikitext-2-raw-v1/test/")
     traindata = load_from_disk("/public/lzy/dataset/wikitext-2-raw-v1/train/")
     testdata = load_from_disk("/public/lzy/dataset/wikitext-2-raw-v1/test/")
-    # tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
 
     trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
@@ -31,14 +26,8 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
 
 
 def get_ptb(nsamples, seed, seqlen, tokenizer):
-    # traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train')
-    # testdata = load_dataset('ptb_text_only', 'penn_treebank', split='test')
-    # traindata = load_from_disk("/home/user0/public2/lzy/data/ptb/train/")
-    # testdata = load_from_disk("/home/user0/public2/lzy/data/ptb/test/")
     traindata = load_from_disk("/public/lzy/dataset/ptb/train/")
     testdata = load_from_disk("/public/lzy/dataset/ptb/test/")
-    # tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-
     trainenc = tokenizer(" ".join(traindata['sentence']), return_tensors='pt')
     testenc = tokenizer(" ".join(testdata['sentence']), return_tensors='pt')
 
@@ -55,14 +44,8 @@ def get_ptb(nsamples, seed, seqlen, tokenizer):
 
 
 def get_c4(nsamples, seed, seqlen, tokenizer):
-    # traindata = load_dataset('allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train')
-    # valdata = load_dataset('allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation')
-    # traindata = load_from_disk("/home/user0/public2/lzy/data/c4/train/")
-    # valdata = load_from_disk("/home/user0/public2/lzy/data/c4/validation/")
     traindata = load_from_disk("/public/lzy/dataset/c4/train/")
     valdata = load_from_disk("/public/lzy/dataset/c4/validation/")
-    # tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-
     random.seed(seed)
     trainloader = []
     for _ in range(nsamples):
