@@ -299,27 +299,15 @@ def compress_model(args, model, dataloader):
         dense_outs = None
     outs = None if args.prune_dense else torch.zeros_like(inps)
 
-    # Init_awq_W = {}
     if args.quant_type == 'awq':
-        # if args.metric_type == 'pqp':
-        #     for i in range(len(layers)):
-        #         layer = layers[i]
-        #         subset = find_layers(layer)
-        #         for name in subset:
-        #             # print(f"pruning layer {i} name {name}")
-        #             indexed_name = f"{name}_layer_{i}"
-        #             Init_awq_W[indexed_name] = subset[name].weight.data.clone()
-
         q_config = {
-            "zero_point": not args.no_zero_point,  # by default True
-            "q_group_size": args.q_group_size,  # whether to use group quantization
+            "zero_point": not args.no_zero_point,  
+            "q_group_size": args.q_group_size, 
         }
         print("Quantization config:", q_config)
 
-        # 如果指定了加载预先计算好的 AWQ 结果
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
-            # 加载 scale 和 clip 参数
             awq_results = torch.load(args.load_awq, map_location="cpu")
             apply_awq(model.model, awq_results)
 
@@ -366,11 +354,6 @@ def compress_model(args, model, dataloader):
 
         Init_W = {}
         if args.wbits < 16:
-            # 自定义量化误差保存根目录（可修改为你想要的路径）
-            # error_save_root = "./quantization_errors_gptq/llama_13b"
-            # 创建目录（不存在则自动创建，避免路径报错）
-            # os.makedirs(error_save_root, exist_ok=True)
-
             if args.quant_type == 'rtn':
                 print(f"---------------- RTN Layer {i} of {len(layers)} ----------------")
                 for name in sparse_layers:
@@ -436,16 +419,6 @@ def compress_model(args, model, dataloader):
                         sparse_layers[name].weight.data = gptq[name].layer.weight.data
                         sparse_layers[name].quantization_error = (W - Q).to(torch.float32)
                         gptq[name].free()
-
-                        # ===================== 保存量化误差 =====================
-                        # 方式1：按层+索引单独保存（推荐，便于后续单独加载分析）
-                        # 构造唯一的文件名（包含name和i，避免重名）
-                        # error_filename = f"{indexed_name}_quant_error.pt"
-                        # error_save_path = os.path.join(error_save_root, error_filename)
-                        # # 保存Tensor到本地
-                        # torch.save(sparse_layers[name].quantization_error, error_save_path)
-                        # print(f"✅ 已保存 {indexed_name} 量化误差到：{error_save_path}")
-
 
             elif args.quant_type == 'awq':
                 for name in sparse_layers:
@@ -676,260 +649,6 @@ def compress_model(args, model, dataloader):
     print(f"Model sparsity: {model_sparsity:.6f}")
     return model_prune_log, model_sparsity
 
-def prune_magnitude(args, model, dataloader, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    prune_start = time.time()
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    if 'llama' in args.model.lower():
-        layers = model.model.model.layers
-        model.model.model.embed_tokens = model.model.model.embed_tokens.to(device)
-    elif "opt" in args.model.lower():
-        layers = model.model.model.decoder.layers
-        model.model.model.decoder.embed_tokens = model.model.model.decoder.embed_tokens.to(device)
-        model.model.model.decoder.embed_positions = model.model.model.decoder.embed_positions.to(device)
-
-    dtype = next(iter(model.model.parameters())).dtype
-    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)  # ori: 128
-    inps.requires_grad = False
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            if "llama" in args.model.lower():
-                cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-
-    layers[0] = layers[0].to(device)
-    layers[0] = Catcher(layers[0])
-    for i in range(args.nsamples):
-        try:
-            batch = dataloader[i]
-            model.model(batch[0].to(device))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    layers = layers.cpu()
-    if 'llama' in args.model.lower():
-        model.model.model.embed_tokens = model.model.model.embed_tokens.cpu()
-        position_ids = cache['position_ids']
-    elif 'opt' in args.model.lower():
-        model.model.model.decoder.embed_tokens = model.model.model.decoder.embed_tokens.cpu()
-        model.model.model.decoder.embed_positions = model.model.model.decoder.embed_positions.cpu()
-        position_ids = None
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    torch.cuda.empty_cache()
-
-    Init_W = {}
-    for i in range(len(layers)):
-        layer = layers[i].to(device)
-        # use_old_forward(layer, recurse=True)
-        subset = find_layers(layer)
-
-        for name in subset:
-            # print(f"pruning layer {i} name {name}")
-            indexed_name = f"{name}_layer_{i}"
-            Init_W[indexed_name] = subset[name].weight.data
-
-        layer = layer.cpu().to(dtype=dtype)
-
-    if args.quant_type == 'awq':
-        q_config = {
-            "zero_point": not args.no_zero_point,  # by default True
-            "q_group_size": args.q_group_size,  # whether to use group quantization
-        }
-        print("Quantization config:", q_config)
-
-        # 如果指定了加载预先计算好的 AWQ 结果
-        if args.load_awq:
-            print("Loading pre-computed AWQ results from", args.load_awq)
-            # 加载 scale 和 clip 参数
-            awq_results = torch.load(args.load_awq, map_location="cpu")
-            apply_awq(model.model, awq_results)
-            # print(awq_results["scale"])
-            # print(awq_results["clip"])
-            # 将 AWQ 参数应用到模型上（修改模型的 FP16 权重，使其对量化更友好）
-
-
-        # # 权重模型量化流程（Weight Quantization）
-        # if args.wbits is not None:
-        #     # 模式 A：伪量化（Fake Quantization）
-        #     # 权重被量化后立即反量化回 FP16，用于评估量化带来的精度损失，不节省显存
-        #     if args.q_backend == "fake":
-        #         # assert (
-        #         #         args.dump_quant is None
-        #         # ), "Need to use real quantization to dump quantized weights"
-        #         # 执行伪量化操作
-        #         pseudo_quantize_model_weight(model.model, w_bit=args.wbits, q_config=q_config)
-        #         # # 如果需要保存伪量化后的模型（依然是 FP16 格式，但数值已离散化）
-        #         # if args.dump_fake:
-        #         #     model.save_pretrained(args.dump_fake)
-        #         #     print("Pseudo-quantized models saved at", args.dump_fake)
-        #
-        #     # 模式 B：真量化（Real Quantization）
-        #     # 将权重打包（Packing）为低比特整数格式（如 INT4），节省显存
-        #     elif args.q_backend == "real":  # real quantization
-        #         # 执行真量化操作（替换 Linear 层，打包权重）
-        #         real_quantize_model_weight(model, w_bit=args.w_bit, q_config=q_config)
-        #
-        #         # 如果需要保存量化后的模型
-        #         if args.dump_quant:
-        #             # 自动修正文件名后缀，确保以 -v2.pt 结尾（AWQ 的命名习惯）
-        #             if not args.dump_quant.endswith("v2.pt"):
-        #                 print("[Info] Auto-change the dump_quant file name to *v2.pt")
-        #                 args.dump_quant = args.dump_quant.replace(".pt", "-v2.pt")
-        #
-        #             # 确保目录存在
-        #             dirpath = os.path.dirname(args.dump_quant)
-        #             os.makedirs(dirpath, exist_ok=True)
-        #
-        #             print(f"Saving the quantized model at {args.dump_quant}...")
-        #             # 保存模型的状态字典到磁盘
-        #             torch.save(model.cpu().state_dict(), args.dump_quant)
-        #             # 保存完成后退出
-        #             exit(0)
-        #     else:
-        #         # 如果 backend 不是 fake 也不是 real，抛出未实现错误
-        #         raise NotImplementedError
-
-    for i in range(len(layers)):
-        layer = layers[i].to(device)
-        use_old_forward(layer, recurse=True)
-        subset = find_layers(layer)
-
-        # Init_W = {}
-        if args.wbits < 16:
-            if args.quant_type == "rtn":
-                for name in subset:
-                    print('RTN quantization.....')
-                    quantizer = Quant()
-                    quantizer.configure(args.wbits, perchannel=True, sym=False)
-                    W = subset[name].weight.data
-                    quantizer.find_params(W, weight=True)
-                    subset[name].weight.data = quant(W, quantizer.scale, quantizer.zero, quantizer.maxq).to(
-                        next(iter(layer.parameters())).dtype)
-            elif args.quant_type == 'gptq':
-                full = subset
-                print(f"---------------- GPTQ Layer {i} of {len(layers)} ----------------")
-                if args.true_sequential:
-                    sequential = [['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'], ['self_attn.o_proj'],
-                                  ['mlp.up_proj', 'mlp.gate_proj'], ['mlp.down_proj']]
-                else:
-                    sequential = [list(full.keys())]
-
-                for names in sequential:
-                    gptq_subset = {n: full[n] for n in names}
-
-                    gptq = {}
-                    for name in gptq_subset:
-                        gptq[name] = GPTQ(gptq_subset[name])
-                        gptq[name].quantizer = Quant()
-                        gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
-
-                    def gptq_add_batch(name):
-                        def tmp(_, inp, out):
-                            gptq[name].add_batch(inp[0].data)
-
-                        return tmp
-
-                    handles = []
-                    for name in gptq_subset:
-                        handles.append(gptq_subset[name].register_forward_hook(gptq_add_batch(name)))
-                    for j in trange(args.nsamples, desc="calc outs before quantization", leave=False):
-                        with torch.no_grad():
-                            if 'llama' in args.model.lower():
-                                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                            elif 'opt' in args.model.lower():
-                                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-                    for h in handles:
-                        h.remove()
-
-                    for name in gptq_subset:
-                        indexed_name = f"{name}_layer_{i}"
-                        Init_W[indexed_name] = subset[name].weight.data.clone()
-                        # W = Init_W[indexed_name]
-                        # print(i, name)
-                        print('Quantizing ...')
-                        gptq[name].fasterquant(
-                            percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order,
-                            static_groups=args.static_groups
-                        )
-                        subset[name].weight.data = gptq[name].layer.weight.data
-                        gptq[name].free()
-            elif args.quant_type == 'awq':
-                # q_config = {
-                #     "zero_point": not args.no_zero_point,  # by default True
-                #     "q_group_size": args.q_group_size,  # whether to use group quantization
-                # }
-                # print("Quantization config:", q_config)
-                #
-                # # 如果指定了加载预先计算好的 AWQ 结果
-                # if args.load_awq:
-                #     print("Loading pre-computed AWQ results from", args.load_awq)
-                #     # 加载 scale 和 clip 参数
-                #     awq_results = torch.load(args.load_awq, map_location="cpu")
-                #     # 将 AWQ 参数应用到模型上（修改模型的 FP16 权重，使其对量化更友好）
-                #     apply_awq(model.model, awq_results)
-                #
-                # apply_awq(model.model, awq_results)
-                #
-                # # # 权重模型量化流程（Weight Quantization）
-                # # if args.q_backend == "fake":
-                # #     # 执行伪量化操作
-                # #     pseudo_quantize_subset_weight(subset, w_bit=args.wbits, q_config=q_config)
-
-                for name in subset:
-                    print(f"quantization layer {i} name {name}")
-                    # m.cuda()
-                    subset[name].weight.data = pseudo_quantize_tensor(
-                        subset[name].weight.data, n_bit=args.wbits, **q_config
-                    )
-                    # m.cpu()
-        for name in subset:
-            print(f"pruning layer {i} name {name}")
-            # indexed_name = f"{name}_layer_{i}"
-            # W = Init_W[indexed_name]
-            W = subset[name].weight.data
-            W_metric = torch.abs(W)
-            if prune_n != 0:
-                W_mask = (torch.zeros_like(W)==1)
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
-            else:
-                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity)].cpu()
-                W_mask = (W_metric<=thresh)
-            subset[name].weight.data[W_mask] = 0
-
-        for j in trange(args.nsamples, desc="calc outs after pruning", leave=False):
-            with torch.no_grad():
-                if 'llama' in args.model.lower():
-                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                elif 'opt' in args.model.lower():
-                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-
-        layer = layer.cpu().to(dtype=dtype)
-        use_new_forward(layer, recurse=True)
-        layers[i] = layer
-        del layer
-        if args.quant_type == 'gptq':
-            del gptq
-        torch.cuda.empty_cache()
-        inps, outs = outs, inps
-
-    prune_time_cost = time.time() - prune_start
-    print(f'Prune time cost: {prune_time_cost / 60:.2f} minutes')
-    model.config.use_cache = use_cache
-
 def prune_sparsegpt(args, model, dataloader, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     prune_start = time.time()
@@ -990,11 +709,8 @@ def prune_sparsegpt(args, model, dataloader, device=torch.device("cuda:0"), prun
             "q_group_size": args.q_group_size,  # whether to use group quantization
         }
         print("Quantization config:", q_config)
-
-        # 如果指定了加载预先计算好的 AWQ 结果
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
-            # 加载 scale 和 clip 参数
             awq_results = torch.load(args.load_awq, map_location="cpu")
             apply_awq(model.model, awq_results)
 
@@ -1099,283 +815,6 @@ def RMSNorm(Output):
     rms = torch.sqrt(torch.mean(Output ** 2, dim=-1, keepdim=True))
     return Output / (rms + 1e-8)
 
-def zo_update(theta, lr, grad, z):
-    return [sub_theta - lr * grad * sub_z for sub_theta, sub_z in zip(theta, z)]
-
-def prune_bawa(args, model, dataloader, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    prune_start = time.time()
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    if 'llama' in args.model.lower():
-        layers = model.model.model.layers
-        model.model.model.embed_tokens = model.model.model.embed_tokens.to(device)
-    elif "opt" in args.model.lower():
-        layers = model.model.model.decoder.layers
-        model.model.model.decoder.embed_tokens = model.model.model.decoder.embed_tokens.to(device)
-        model.model.model.decoder.embed_positions = model.model.model.decoder.embed_positions.to(device)
-
-    dtype = next(iter(model.model.parameters())).dtype
-    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)  # ori: 128
-    inps.requires_grad = False
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            if "llama" in args.model.lower():
-                cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-
-    layers[0] = layers[0].to(device)
-    layers[0] = Catcher(layers[0])
-    for i in range(args.nsamples):
-        try:
-            batch = dataloader[i]
-            model.model(batch[0].to(device))
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    layers = layers.cpu()
-    if 'llama' in args.model.lower():
-        model.model.model.embed_tokens = model.model.model.embed_tokens.cpu()
-        position_ids = cache['position_ids']
-    elif 'opt' in args.model.lower():
-        model.model.model.decoder.embed_tokens = model.model.model.decoder.embed_tokens.cpu()
-        model.model.model.decoder.embed_positions = model.model.model.decoder.embed_positions.cpu()
-        position_ids = None
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    torch.cuda.empty_cache()
-
-    for i in range(len(layers)):
-        layer = layers[i].to(device)
-        use_old_forward(layer, recurse=True)
-        subset = find_layers(layer)
-
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name])
-
-        def add_batch(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-        for j in range(args.nsamples):
-            with torch.no_grad():
-                if 'llama' in args.model.lower():
-                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                elif 'opt' in args.model.lower():
-                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        for h in handles:
-            h.remove()
-
-        fouts_dense = RMSNorm(outs)
-
-        theta = [torch.nn.Parameter(torch.tensor([1.0, 1.0, 0.5], device=device)) for _ in range(len(subset))]
-        # theta = torch.tensor([1.0, 1.0, 0.5])
-        z = [torch.normal(mean=0, std=1, size=(3,), device=device) for _ in range(len(subset))]
-        # Step 1
-        theta = zo_update(theta, 1, 1e-2, z)
-        # theta_plus = zo_update(theta, 1, 1e-2, z)
-        loss1 = compute_layer_loss(layer, inps, fouts_dense, subset, wrapped_layers, theta, args, attention_mask,
-                                   position_ids, prune_n, prune_m)
-        # print("loss1:", loss1)
-        # Step 2
-        theta  = zo_update(theta, -2, 1e-2, z)
-        loss2 = compute_layer_loss(layer, inps, fouts_dense, subset, wrapped_layers, theta, args, attention_mask,
-                                   position_ids, prune_n, prune_m)
-        # print("loss2:", loss2)
-        theta= zo_update(theta, 1, 1e-2, z)
-        # Update
-        grad = (loss1 - loss2) / 2
-        # print("grad:", grad)
-        theta = zo_update(theta, 0.2, grad, z)
-        print(f"[Layer {i}] Updated theta: {theta}")
-
-        if args.wbits < 16:
-            if args.quant_type == 'rtn':
-                for name in subset:
-                    print('RTN quantization.....')
-                    # indexed_name = f"{name}_layer_{i}"
-                    quantizer = Quant()
-                    quantizer.configure(args.wbits, perchannel=True, sym=False)
-                    W = subset[name].weight.data
-                    # W = subset[name].weight.data
-                    quantizer.find_params(W, weight=True)
-                    subset[name].weight.data = quant(W, quantizer.scale, quantizer.zero, quantizer.maxq).to(
-                        next(iter(layer.parameters())).dtype)
-                    # print("======================== RTN weight =====================")
-                    # print(subset[name].weight.data)
-            elif args.quant_type == 'gptq':
-                full = subset
-                print(f"---------------- GPTQ Layer {i} of {len(layers)} ----------------")
-                if args.true_sequential:
-                    sequential = [['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'], ['self_attn.o_proj'],
-                                  ['mlp.up_proj', 'mlp.gate_proj'], ['mlp.down_proj']]
-                else:
-                    sequential = [list(full.keys())]
-
-                for names in sequential:
-                    gptq_subset = {n: full[n] for n in names}
-
-                    gptq = {}
-                    for name in gptq_subset:
-                        gptq[name] = GPTQ(gptq_subset[name])
-                        gptq[name].quantizer = Quant()
-                        gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
-
-                    def gptq_add_batch(name):
-                        def tmp(_, inp, out):
-                            gptq[name].add_batch(inp[0].data)
-
-                        return tmp
-
-                    handles = []
-                    for name in gptq_subset:
-                        handles.append(gptq_subset[name].register_forward_hook(gptq_add_batch(name)))
-                    for j in trange(args.nsamples, desc="calc outs before quantization", leave=False):
-                        with torch.no_grad():
-                            if 'llama' in args.model.lower():
-                                outs[j] = \
-                                layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                            elif 'opt' in args.model.lower():
-                                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-                    for h in handles:
-                        h.remove()
-
-                    for name in gptq_subset:
-                        print(i, name)
-                        print('Quantizing ...')
-                        gptq[name].fasterquant(
-                            percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order,
-                            static_groups=args.static_groups
-                        )
-                        # quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
-                        subset[name].weight.data = gptq[name].layer.weight.data
-                        gptq[name].free()
-
-        # Final prune with updated theta
-        for i, name in enumerate(subset):
-            W_metric = (
-                    compute_importance(subset[name].weight.data, theta[i][0], theta[i][1]) *
-                    ((torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))) ** theta[i][2])
-            )
-
-            W_mask = torch.zeros_like(W_metric, dtype=torch.bool)
-            if prune_n != 0:
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:, ii:(ii + prune_m)].float()
-                        W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
-            else:
-                sort_res = torch.sort(W_metric, dim=-1, stable=True)
-
-                if args.use_variant:
-                    tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                    sum_before = W_metric.sum(dim=1)
-
-                    alpha = 0.4
-                    alpha_hist = [0., 0.8]
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                    while (torch.abs(cur_sparsity - args.sparsity) > 0.001) and (
-                            alpha_hist[1] - alpha_hist[0] >= 0.001):
-                        if cur_sparsity > args.sparsity:
-                            alpha_new = (alpha + alpha_hist[0]) / 2.0
-                            alpha_hist[1] = alpha
-                        else:
-                            alpha_new = (alpha + alpha_hist[1]) / 2.0
-                            alpha_hist[0] = alpha
-                        alpha = alpha_new
-                        W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                else:
-                    indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity)]
-                    W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0
-
-        for j in trange(args.nsamples, desc="calc outs after pruning", leave=False):
-            with torch.no_grad():
-                if 'llama' in args.model.lower():
-                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-                elif 'opt' in args.model.lower():
-                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-
-        layer = layer.cpu().to(dtype=dtype)
-        use_new_forward(layer, recurse=True)
-        layers[i] = layer
-        del layer
-        torch.cuda.empty_cache()
-
-        inps, outs = outs, inps
-
-    prune_time_cost = time.time() - prune_start
-    print(f'Prune time cost: {prune_time_cost / 60:.2f} minutes')
-    model.config.use_cache = use_cache
-    torch.cuda.empty_cache()
-
-
-def compute_layer_loss(layer, inps, fouts_dense, subset, wrapped_layers, theta, args, attention_mask, position_ids,
-                       prune_n, prune_m):
-    outs = torch.zeros_like(inps)
-    for i, name in enumerate(subset):
-        W_metric = (
-                compute_importance(subset[name].weight.data, theta[i][0], theta[i][1]) *
-                ((torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))) ** theta[i][2])
-        )
-
-        W_mask = torch.zeros_like(W_metric, dtype=torch.bool)
-        if prune_n != 0:
-            for ii in range(W_metric.shape[1]):
-                if ii % prune_m == 0:
-                    tmp = W_metric[:, ii:(ii + prune_m)].float()
-                    W_mask.scatter_(1, ii + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
-        else:
-            sort_res = torch.sort(W_metric, dim=-1, stable=True)
-
-            if args.use_variant:
-                tmp_metric = torch.cumsum(sort_res[0], dim=1)
-                sum_before = W_metric.sum(dim=1)
-
-                alpha = 0.4
-                alpha_hist = [0., 0.8]
-                W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-                while (torch.abs(cur_sparsity - args.sparsity) > 0.001) and (alpha_hist[1] - alpha_hist[0] >= 0.001):
-                    if cur_sparsity > args.sparsity:
-                        alpha_new = (alpha + alpha_hist[0]) / 2.0
-                        alpha_hist[1] = alpha
-                    else:
-                        alpha_new = (alpha + alpha_hist[1]) / 2.0
-                        alpha_hist[0] = alpha
-                    alpha = alpha_new
-                    W_mask, cur_sparsity = return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before)
-            else:
-                indices = sort_res[1][:, :int(W_metric.shape[1] * args.sparsity)]
-                W_mask.scatter_(1, indices, True)
-
-        subset[name].weight.data[W_mask] = 0
-
-    for j in range(args.nsamples):
-        with torch.no_grad():
-            if 'llama' in args.model.lower():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-            elif 'opt' in args.model.lower():
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-    fouts_sparse = RMSNorm(outs)
-    loss = torch.norm(fouts_dense - fouts_sparse, p=2).float()
-    return loss
-
-
 def prune_wanda_ria_bawa(args, model, dataloader, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
     prune_start = time.time()
     use_cache = model.config.use_cache
@@ -1435,10 +874,8 @@ def prune_wanda_ria_bawa(args, model, dataloader, device=torch.device("cuda:0"),
         }
         print("Quantization config:", q_config)
 
-        # 如果指定了加载预先计算好的 AWQ 结果
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
-            # 加载 scale 和 clip 参数
             awq_results = torch.load(args.load_awq, map_location="cpu")
             apply_awq(model.model, awq_results)
 
@@ -1467,11 +904,6 @@ def prune_wanda_ria_bawa(args, model, dataloader, device=torch.device("cuda:0"),
                     outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         for h in handles:
             h.remove()
-
-        # Init_W = {}
-        # for name in subset:
-        #     indexed_name = f"{name}_layer_{i}"
-        #     Init_W[indexed_name] = subset[name].weight.data.clone()
 
         if args.wbits < 16:
             if args.quant_type == 'rtn':
@@ -1542,30 +974,16 @@ def prune_wanda_ria_bawa(args, model, dataloader, device=torch.device("cuda:0"),
         for name in subset:
             print(f"pruning layer {i} name {name}")
             if args.metric_type == 'ria':
-                # indexed_name = f"{name}_layer_{i}"
-                # W = Init_W[indexed_name]
                 W_metric = ((torch.abs(subset[name].weight.data)/torch.sum(torch.abs(subset[name].weight.data), dim=0)
                             + torch.abs(subset[name].weight.data)/torch.sum(torch.abs(subset[name].weight.data), dim=1).reshape(-1, 1))
                             * (torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1))))**0.5)
-                # W_metric = ((torch.abs(W) / torch.sum(torch.abs(W), dim=0)
-                #              + torch.abs(W) / torch.sum(torch.abs(W), dim=1).reshape(-1, 1))
-                #             * (torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))) ** 0.5)
             elif args.metric_type == 'bawa':
-                # indexed_name = f"{name}_layer_{i}"
-                # W = Init_W[indexed_name]
-                # W_metric = (
-                #         compute_importance(W) *
-                #        ((torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))) ** 0.5)
-                #  )
                 W_metric = (
                         compute_importance(subset[name].weight.data) *
                         ((torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))) ** 0.5)
                 )
             else:
-                # indexed_name = f"{name}_layer_{i}"
-                # W = Init_W[indexed_name]
                 W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
-                # W_metric = torch.abs(W) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
 
             W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
             if prune_n != 0:
@@ -1947,14 +1365,7 @@ def prune_pqp(args, model, dataloader, device=torch.device("cuda:0"), prune_n=0,
                 PMW = mul(mul(W.to(dtype=torch.float32), W.to(dtype=torch.float32)), mms(G.to(device=W.device, dtype=torch.float32)))
             else:
                 PMW = None
-
-            # PMQW = (torch.abs(subset[name].weight.data) / torch.sum(torch.abs(subset[name].weight.data), dim=0) + torch.abs(subset[name].weight.data) / torch.sum(torch.abs(subset[name].weight.data), dim=1).reshape(-1,1)) * (sqrt(X)) ** 0.5
-            # PMQW = compute_importance(subset[name].weight.data) * ((torch.sqrt(X)) ** 0.5)
-            # PMQW = torch.abs(subset[name].weight.data * sqrt(X))
             W_metric = torch.abs(subset[name].weight.data) * mms(PMW)
-            # W_metric = PMQW * mms(PMW)
-            # PMW = (torch.abs(W) / torch.sum(torch.abs(W), dim=0) + torch.abs(W) / torch.sum(torch.abs(W), dim=1).reshape(-1, 1))
-            # W_metric = PMW
 
             W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
             if prune_n != 0:
@@ -2008,4 +1419,5 @@ def prune_pqp(args, model, dataloader, device=torch.device("cuda:0"), prune_n=0,
     prune_time_cost = time.time() - prune_start
     print(f'Prune time cost: {prune_time_cost / 60:.2f} minutes')
     model.config.use_cache = use_cache
+
     torch.cuda.empty_cache()
