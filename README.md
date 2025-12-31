@@ -1,5 +1,5 @@
 # PQP
-![intuition](figures/PQP-Workflow.pdf)
+![intuition](figures/PQP-Workflow.png)
 
 This repository contains code to reproduce the key results of the paper PQP: Joint Post-training Quantization and Pruning for Efficient LLM
 Compression.
